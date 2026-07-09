@@ -1,0 +1,13 @@
+{
+  "language": "japanese",
+  "autoMemoryEnabled": false,
+  "hooks": {
+    "PostToolUse": "Write|Edit",
+    "hooks": [
+      {
+        "type": "command",
+        "command": "nix fmt"
+      }
+    ]
+  }
+}
