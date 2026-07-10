@@ -9,5 +9,15 @@
         "command": "nix fmt"
       }
     ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(nix build)",
+      "Bash(nix fmt)",
+      "Bash(gh run list *)",
+      "Bash(gh run view *)",
+      "Bash(git show *)",
+      "Bash(git diff *)"
+    ]
   }
 }
