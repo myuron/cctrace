@@ -63,7 +63,7 @@ PRはCIでformat/lint/test/buildが全て通る必要があります。push前�
 必要に応じて以下のスキルを使用してください
 
 - `commit` : commitする際に使用する
-- `tdd` : tddを実行する際に使用する 
+- `tdd` : tddを実行する際に使用する
 
 ## Git Rules
 
