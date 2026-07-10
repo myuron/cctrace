@@ -78,3 +78,7 @@ PRはCIでformat/lint/test/buildが全て通る必要があります。push前�
 
 - 機能追加の場合:`feat/*`
 - バグ修正の場合:`fix/*`
+
+### PR Title
+
+- PRタイトルに絵文字を使用してはいけない
