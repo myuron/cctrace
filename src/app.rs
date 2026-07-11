@@ -27,6 +27,9 @@ pub enum Action {
     Enter,
     Back,
     ToggleBranches,
+    /// 次/前のフック起動ブロックへジャンプする (発見性向上)。
+    NextHook,
+    PrevHook,
     Quit,
 }
 
@@ -80,6 +83,31 @@ impl OpenSession {
 
     fn select_last(&mut self) {
         self.selected = self.blocks.len().saturating_sub(1);
+    }
+
+    /// 選択を次のフックブロックへ移す。末尾の先には先頭側へ巡回する。
+    /// フックが無ければ選択は動かさない。
+    fn select_next_hook(&mut self) {
+        let n = self.blocks.len();
+        for step in 1..=n {
+            let i = (self.selected + step) % n;
+            if self.blocks[i].is_hook() {
+                self.selected = i;
+                return;
+            }
+        }
+    }
+
+    /// 選択を前のフックブロックへ移す。先頭の手前は末尾側へ巡回する。
+    fn select_prev_hook(&mut self) {
+        let n = self.blocks.len();
+        for step in 1..=n {
+            let i = (self.selected + n - step) % n;
+            if self.blocks[i].is_hook() {
+                self.selected = i;
+                return;
+            }
+        }
     }
 
     /// 選択中ブロックが折りたたみ対象なら展開/折りたたみをトグルする。
@@ -142,7 +170,7 @@ impl App {
             }
             Action::Enter => self.open_selected(),
             Action::Back | Action::Quit => self.should_quit = true,
-            Action::ToggleBranches => {}
+            Action::ToggleBranches | Action::NextHook | Action::PrevHook => {}
         }
     }
 
@@ -155,6 +183,8 @@ impl App {
             Action::Bottom => self.with_open(OpenSession::select_last),
             // 選択中ブロックが折りたたみ対象なら開閉する。
             Action::Enter => self.with_open(OpenSession::toggle_selected),
+            Action::NextHook => self.with_open(OpenSession::select_next_hook),
+            Action::PrevHook => self.with_open(OpenSession::select_prev_hook),
             Action::ToggleBranches => {
                 self.show_branches = !self.show_branches;
                 let show_branches = self.show_branches;
@@ -305,6 +335,38 @@ mod tests {
         app.handle(Action::Down);
         app.handle(Action::Enter);
         assert!(!app.open.as_ref().unwrap().expanded[1]);
+    }
+
+    #[test]
+    fn next_and_prev_hook_jump_to_hook_blocks() {
+        // block0: user, block1: hook, block2: assistant, block3: hook。
+        let jsonl = "{\"type\":\"user\",\"message\":{\"content\":\"a\"}}\n\
+                     {\"type\":\"system\",\"subtype\":\"stop_hook_summary\",\"hookCount\":1}\n\
+                     {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"b\"}]}}\n\
+                     {\"type\":\"system\",\"subtype\":\"stop_hook_summary\",\"hookCount\":1}";
+        let mut app = App::new(vec![]);
+        app.screen = Screen::Timeline;
+        app.open = Some(open_session_for_test("s", parse_jsonl(jsonl)));
+        assert_eq!(app.open.as_ref().unwrap().selected, 0);
+        app.handle(Action::NextHook); // 0 -> 1 (最初の hook)
+        assert_eq!(app.open.as_ref().unwrap().selected, 1);
+        app.handle(Action::NextHook); // 1 -> 3 (次の hook)
+        assert_eq!(app.open.as_ref().unwrap().selected, 3);
+        app.handle(Action::NextHook); // 3 -> 1 (末尾から先頭へ巻き戻る)
+        assert_eq!(app.open.as_ref().unwrap().selected, 1);
+        app.handle(Action::PrevHook); // 1 -> 3 (先頭から末尾へ巻き戻る)
+        assert_eq!(app.open.as_ref().unwrap().selected, 3);
+    }
+
+    #[test]
+    fn hook_jump_is_noop_without_hooks() {
+        let mut app = App::new(vec![]);
+        app.screen = Screen::Timeline;
+        app.open = Some(open_session_for_test("s", three_block_session()));
+        app.handle(Action::NextHook);
+        assert_eq!(app.open.as_ref().unwrap().selected, 0);
+        app.handle(Action::PrevHook);
+        assert_eq!(app.open.as_ref().unwrap().selected, 0);
     }
 
     #[test]

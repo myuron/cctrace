@@ -86,11 +86,14 @@ fn draw_timeline(frame: &mut Frame, app: &mut App) {
         return;
     };
 
+    // フック起動数はツールの核 (フックが起動したかの確認)。ヘッダに常時出す。
+    let hook_count = open.blocks.iter().filter(|b| b.is_hook()).count();
     let header = format!(
-        " {}   entries: {}{}   branches: {}",
+        " {}   entries: {}{}   hooks: {}   branches: {}",
         open.meta.id,
         open.data.entries.len(),
         skipped_suffix(open.data.skipped_lines),
+        hook_count,
         if app.show_branches { "on" } else { "off" },
     );
     frame.render_widget(
@@ -141,7 +144,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App) {
 
     frame.render_widget(
         hint_line(
-            "↑/↓ or j/k: 選択   Enter: 開閉   g/G: 先頭/末尾   b: 分岐表示   Esc: 一覧   q: 終了",
+            "↑/↓ or j/k: 選択   Enter: 開閉   g/G: 先頭/末尾   h/H: フック   b: 分岐表示   Esc: 一覧   q: 終了",
         ),
         areas[2],
     );
@@ -159,9 +162,16 @@ pub struct TimelineBlock {
     time: String,
     kind: Line<'static>,
     lines: Vec<Line<'static>>,
+    /// フック起動ブロックか。ヘッダのフック数集計と `h`/`H` ジャンプに使う。
+    is_hook: bool,
 }
 
 impl TimelineBlock {
+    /// フック起動を表すブロックか (発見性向上のジャンプ・集計に用いる)。
+    pub fn is_hook(&self) -> bool {
+        self.is_hook
+    }
+
     /// 2 行以上を持つブロックは折りたたみ対象。1 行のブロックは常に全表示。
     pub fn is_foldable(&self) -> bool {
         self.lines.len() >= 2
@@ -206,6 +216,7 @@ fn entry_blocks(entry: &Entry, blocks: &mut Vec<TimelineBlock>) {
                 time,
                 kind: dim_line("system"),
                 lines: vec![dim_line(label)],
+                is_hook: false,
             });
         }
         EntryKind::Hook(summary) => {
@@ -216,6 +227,7 @@ fn entry_blocks(entry: &Entry, blocks: &mut Vec<TimelineBlock>) {
                     Style::default().fg(HOOK_COLOR).add_modifier(Modifier::BOLD),
                 )),
                 lines: hook_lines(summary),
+                is_hook: true,
             });
         }
         EntryKind::Attachment { attachment_type } => {
@@ -224,6 +236,7 @@ fn entry_blocks(entry: &Entry, blocks: &mut Vec<TimelineBlock>) {
                 time,
                 kind: dim_line("attachment"),
                 lines: vec![dim_line(label)],
+                is_hook: false,
             });
         }
         EntryKind::Unknown { type_name } => {
@@ -238,6 +251,7 @@ fn entry_blocks(entry: &Entry, blocks: &mut Vec<TimelineBlock>) {
                 time,
                 kind: dim_line(label),
                 lines: vec![Line::from("")],
+                is_hook: false,
             });
         }
         EntryKind::Meta { .. } => {}
@@ -282,6 +296,7 @@ fn push_message_blocks(
             time: if i == 0 { time.clone() } else { String::new() },
             kind: if i == 0 { kind.clone() } else { Line::from("") },
             lines,
+            is_hook: false,
         });
     }
 }
@@ -534,6 +549,24 @@ mod tests {
         );
         let out = joined(&s.entries, false);
         assert!(out.contains("[skill:commit]"), "got: {out}");
+    }
+
+    #[test]
+    fn only_hook_block_is_flagged_is_hook() {
+        let s = parse_jsonl(
+            "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n\
+             {\"type\":\"system\",\"subtype\":\"stop_hook_summary\",\"hookCount\":1}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"yo\"}]}}",
+        );
+        let blocks = build_blocks(&s.entries, false);
+        let hook_count = blocks.iter().filter(|b| b.is_hook()).count();
+        assert_eq!(hook_count, 1, "exactly one hook block expected");
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b.is_hook() && text_of(&b.kind) == "hook"),
+            "the hook block should carry the hook kind label"
+        );
     }
 
     #[test]
