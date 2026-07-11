@@ -1,0 +1,559 @@
+//! Ratatui による描画 (SPEC §7 / §8)。
+//!
+//! タイムライン表のブロック生成 (`build_blocks`) は描画から独立した純関数にし、
+//! 「Skill 起動」「attributionSkill 由来」のハイライトや折りたたみ判定を
+//! 単体テストできるようにする。
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table};
+
+use crate::app::{App, Screen};
+use crate::model::{Block as ContentBlock, Entry, EntryKind};
+
+const SKILL_COLOR: Color = Color::Magenta;
+
+/// 現在の画面に応じて全体を描画する。スクロール上限は viewport 依存のためここで確定する。
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    match app.screen {
+        Screen::SessionList => draw_session_list(frame, app),
+        Screen::Timeline => draw_timeline(frame, app),
+    }
+}
+
+fn draw_session_list(frame: &mut Frame, app: &App) {
+    let areas = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(frame.area());
+
+    frame.render_widget(
+        Line::from(Span::styled(
+            " cctrace — sessions ",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        areas[0],
+    );
+
+    if app.sessions.is_empty() {
+        let empty =
+            Paragraph::new("このプロジェクトのセッションが見つかりません (~/.claude/projects)。")
+                .block(Block::default().borders(Borders::ALL));
+        frame.render_widget(empty, areas[1]);
+    } else {
+        let items: Vec<ListItem> = app
+            .sessions
+            .iter()
+            .map(|s| {
+                let title = s.title.as_deref().unwrap_or("(no title)");
+                ListItem::new(format!("{}  {}", format_mtime(s.modified), title))
+            })
+            .collect();
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL))
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        let mut state = ListState::default();
+        state.select(Some(app.list_selected));
+        frame.render_stateful_widget(list, areas[1], &mut state);
+    }
+
+    frame.render_widget(
+        hint_line("↑/↓ or j/k: 移動   Enter: 開く   q: 終了"),
+        areas[2],
+    );
+}
+
+fn draw_timeline(frame: &mut Frame, app: &mut App) {
+    let areas = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(frame.area());
+
+    let Some(open) = &mut app.open else {
+        return;
+    };
+
+    let header = format!(
+        " {}   entries: {}{}   branches: {}",
+        open.meta.id,
+        open.data.entries.len(),
+        skipped_suffix(open.data.skipped_lines),
+        if app.show_branches { "on" } else { "off" },
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            header,
+            Style::default().add_modifier(Modifier::BOLD),
+        ))),
+        areas[0],
+    );
+
+    // ブロックはキャッシュ済み (OpenSession)。展開状態に応じて可視行へ平坦化する。
+    // 再描画はキー入力駆動 (main のイベントループ) なので、入力ごとに 1 度だけ
+    // 平坦化するコストは無視できる。選択ブロックの先頭行の位置も併せて求める。
+    let mut rows: Vec<Row> = Vec::new();
+    let mut selected_row = 0usize;
+    for (i, block) in open.blocks.iter().enumerate() {
+        if i == open.selected {
+            selected_row = rows.len();
+        }
+        let expanded = open.expanded.get(i).copied().unwrap_or(false);
+        rows.extend(block_rows(block, expanded));
+    }
+
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Min(10),
+    ];
+    let header = Row::new(["Time", "Kind", "Detail"]).style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    // 選択ブロックの先頭行を選択状態にし、可視領域維持のスクロールは TableState に委ねる。
+    let selection = (!open.blocks.is_empty()).then_some(selected_row);
+    open.table_state.select(selection);
+    frame.render_stateful_widget(table, areas[1], &mut open.table_state);
+
+    frame.render_widget(
+        hint_line(
+            "↑/↓ or j/k: 選択   Enter: 開閉   g/G: 先頭/末尾   b: 分岐表示   Esc: 一覧   q: 終了",
+        ),
+        areas[2],
+    );
+}
+
+/// タイムライン表の 1 ブロック。user/assistant の 1 content ブロック、または
+/// system/attachment/unknown の 1 エントリに対応する。描画から独立した純データにして
+/// ハイライトや折りたたみ判定を単体テストできるようにする。
+///
+/// 同一エントリの 2 ブロック目以降は time/kind を空にして表を詰め、kind 列が
+/// 埋まっている行が新しいエントリの先頭であることを示す。`lines` が 2 行以上なら
+/// 折りたたみ対象 (`is_foldable`)。
+#[derive(Debug, Clone)]
+pub struct TimelineBlock {
+    time: String,
+    kind: Line<'static>,
+    lines: Vec<Line<'static>>,
+}
+
+impl TimelineBlock {
+    /// 2 行以上を持つブロックは折りたたみ対象。1 行のブロックは常に全表示。
+    pub fn is_foldable(&self) -> bool {
+        self.lines.len() >= 2
+    }
+}
+
+/// エントリ列をタイムライン表のブロックへ変換する (SPEC §6.2 / §7)。
+///
+/// timestamp 昇順で並べる (ISO8601 は辞書順=時系列順)。安定ソートなので同一
+/// timestamp や timestamp 欠落エントリは記録順を保つ。
+/// 既定は主系列のみを線形表示。`show_branches` が真のときサイドチェーンも含める。
+/// メタ情報 (`EntryKind::Meta`) は常に非表示。
+pub fn build_blocks(entries: &[Entry], show_branches: bool) -> Vec<TimelineBlock> {
+    let mut ordered: Vec<&Entry> = entries.iter().collect();
+    ordered.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    let mut blocks = Vec::new();
+    for entry in ordered {
+        if !entry.kind.is_visible_by_default() {
+            continue;
+        }
+        if entry.is_sidechain && !show_branches {
+            continue;
+        }
+        entry_blocks(entry, &mut blocks);
+    }
+    blocks
+}
+
+fn entry_blocks(entry: &Entry, blocks: &mut Vec<TimelineBlock>) {
+    let time = time_col(entry);
+    match &entry.kind {
+        EntryKind::User(content) => {
+            push_message_blocks(blocks, time, "You", Color::Green, content, entry)
+        }
+        EntryKind::Assistant(content) => {
+            push_message_blocks(blocks, time, "Claude", Color::Cyan, content, entry)
+        }
+        EntryKind::System { subtype, .. } => {
+            let label = subtype.clone().unwrap_or_default();
+            blocks.push(TimelineBlock {
+                time,
+                kind: dim_line("system"),
+                lines: vec![dim_line(label)],
+            });
+        }
+        EntryKind::Attachment { attachment_type } => {
+            let label = attachment_type.clone().unwrap_or_else(|| "?".into());
+            blocks.push(TimelineBlock {
+                time,
+                kind: dim_line("attachment"),
+                lines: vec![dim_line(label)],
+            });
+        }
+        EntryKind::Unknown { type_name } => {
+            // kind 列が空だと継続ブロック (空 kind) と見分けが付かないため、
+            // type 欠落 (空文字) のときはプレースホルダを入れて先頭行を示す。
+            let label = if type_name.is_empty() {
+                "unknown"
+            } else {
+                type_name
+            };
+            blocks.push(TimelineBlock {
+                time,
+                kind: dim_line(label),
+                lines: vec![Line::from("")],
+            });
+        }
+        EntryKind::Meta { .. } => {}
+    }
+}
+
+/// user/assistant メッセージを表のブロック列へ展開する。エントリ先頭ブロックにのみ
+/// time と kind (役割) を置き、以降は継続ブロック (time/kind 空) にする。中身が空の
+/// content ブロックは飛ばし、全て空なら 1 ブロックも作らない。
+fn push_message_blocks(
+    blocks: &mut Vec<TimelineBlock>,
+    time: String,
+    role: &str,
+    color: Color,
+    content: &[ContentBlock],
+    entry: &Entry,
+) {
+    let mut lines_per_block: Vec<Vec<Line<'static>>> = content
+        .iter()
+        .map(block_detail_lines)
+        .filter(|lines| !lines.is_empty())
+        .collect();
+    if lines_per_block.is_empty() {
+        return;
+    }
+
+    // kind 列は狭いので、attributionSkill バッジは先頭ブロックの先頭行の頭に付ける。
+    if let Some(badge) = attribution_badge(entry) {
+        let first_block = &mut lines_per_block[0];
+        let first = first_block.remove(0);
+        let mut spans = vec![badge, Span::raw(" ")];
+        spans.extend(first.spans);
+        first_block.insert(0, Line::from(spans));
+    }
+
+    let kind = Line::from(Span::styled(
+        role.to_string(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ));
+    for (i, lines) in lines_per_block.into_iter().enumerate() {
+        blocks.push(TimelineBlock {
+            time: if i == 0 { time.clone() } else { String::new() },
+            kind: if i == 0 { kind.clone() } else { Line::from("") },
+            lines,
+        });
+    }
+}
+
+/// 1 ブロックを可視行 (Row) へ展開する。折りたたみ対象は既定で先頭行のみ表示し
+/// 折りたたみマーカー `[+N]` を付ける。`expanded` のとき全行を出し `[-]` を付ける。
+/// 継続行は time/kind を空にして表を詰める。
+fn block_rows(block: &TimelineBlock, expanded: bool) -> Vec<Row<'static>> {
+    let foldable = block.is_foldable();
+    let mut head = block.lines[0].clone();
+    if foldable {
+        let marker = if expanded {
+            Span::styled(" [-]", dim_style())
+        } else {
+            Span::styled(format!(" [+{}]", block.lines.len() - 1), dim_style())
+        };
+        head.spans.push(marker);
+    }
+    let mut rows = vec![Row::new(vec![
+        Cell::from(block.time.clone()),
+        Cell::from(block.kind.clone()),
+        Cell::from(head),
+    ])];
+    if foldable && expanded {
+        for line in &block.lines[1..] {
+            rows.push(Row::new(vec![
+                Cell::from(String::new()),
+                Cell::from(Line::from("")),
+                Cell::from(line.clone()),
+            ]));
+        }
+    }
+    rows
+}
+
+fn block_detail_lines(block: &ContentBlock) -> Vec<Line<'static>> {
+    match block {
+        ContentBlock::Text(text) => text_body_lines(text, Color::Reset),
+        ContentBlock::Thinking(text) => {
+            let mut lines = vec![dim_line("· thinking")];
+            lines.extend(
+                text_body_lines(text, Color::DarkGray)
+                    .into_iter()
+                    .map(|l| l.style(Style::default().add_modifier(Modifier::DIM))),
+            );
+            lines
+        }
+        ContentBlock::ToolUse {
+            name,
+            summary,
+            skill,
+        } => vec![tool_use_line(name, summary, skill.as_deref())],
+        ContentBlock::ToolResult { summary } => {
+            vec![dim_line(format!("↳ result: {summary}"))]
+        }
+    }
+}
+
+/// tool_use の 1 行。`Skill` 起動は SPEC §7 に従い強調する。
+fn tool_use_line(name: &str, summary: &str, skill: Option<&str>) -> Line<'static> {
+    if let Some(skill) = skill {
+        return Line::from(vec![Span::styled(
+            format!("✦ Skill: {skill}"),
+            Style::default()
+                .fg(SKILL_COLOR)
+                .add_modifier(Modifier::BOLD),
+        )]);
+    }
+    let text = if summary.is_empty() {
+        format!("⚙ {name}")
+    } else {
+        format!("⚙ {name}  {summary}")
+    };
+    Line::from(Span::styled(text, Style::default().fg(Color::Yellow)))
+}
+
+/// 本文テキストを行に分割する (折り返しはせず改行で分割、長い行は描画時にクリップ)。
+fn text_body_lines(text: &str, color: Color) -> Vec<Line<'static>> {
+    text.lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(color))))
+        .collect()
+}
+
+/// timestamp (ISO8601) から時刻列 `HH:MM:SS` を取り出す。欠落・異常時は空文字。
+fn time_col(entry: &Entry) -> String {
+    entry
+        .timestamp
+        .as_deref()
+        .and_then(|ts| ts.split('T').nth(1))
+        .map(|t| t.chars().take(8).collect())
+        .unwrap_or_default()
+}
+
+/// attributionSkill が付いたエントリに「Skill 由来」バッジを作る (SPEC §7)。
+fn attribution_badge(entry: &Entry) -> Option<Span<'static>> {
+    entry.attribution_skill.as_ref().map(|skill| {
+        Span::styled(
+            format!("[skill:{skill}]"),
+            Style::default()
+                .fg(SKILL_COLOR)
+                .add_modifier(Modifier::BOLD),
+        )
+    })
+}
+
+fn dim_style() -> Style {
+    Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM)
+}
+
+fn dim_line(text: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(text.into(), dim_style()))
+}
+
+fn hint_line(text: &str) -> Paragraph<'static> {
+    Paragraph::new(Line::from(Span::styled(
+        format!(" {text}"),
+        Style::default().fg(Color::DarkGray),
+    )))
+}
+
+fn skipped_suffix(skipped: usize) -> String {
+    if skipped == 0 {
+        String::new()
+    } else {
+        format!(" (skipped {skipped})")
+    }
+}
+
+/// mtime を `YYYY-MM-DD HH:MM` 相当の UTC 文字列に整形する (依存を増やさない簡易実装)。
+fn format_mtime(time: std::time::SystemTime) -> String {
+    let secs = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_unix_utc(secs)
+}
+
+/// Unix 秒を UTC の `YYYY-MM-DD HH:MM` に変換する。うるう秒は無視する。
+fn format_unix_utc(secs: u64) -> String {
+    let days = secs / 86_400;
+    let tod = secs % 86_400;
+    let (hh, mm) = (tod / 3600, (tod % 3600) / 60);
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}-{mo:02}-{d:02} {hh:02}:{mm:02}")
+}
+
+/// Howard Hinnant のアルゴリズムで「1970-01-01 からの日数」を暦日に変換する。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::parse_jsonl;
+
+    /// Line を可視テキストへ平坦化する (スタイルは無視、内容だけ検証する)。
+    fn text_of(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// 全ブロックの全行を改行区切りのテキストへ平坦化する (内容だけ検証する)。
+    fn joined(entries: &[Entry], show_branches: bool) -> String {
+        build_blocks(entries, show_branches)
+            .iter()
+            .flat_map(|b| b.lines.iter())
+            .map(text_of)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn skill_invocation_is_highlighted() {
+        let s = parse_jsonl(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Skill","input":{"skill":"commit"}}]}}"#,
+        );
+        let out = joined(&s.entries, false);
+        assert!(out.contains("✦ Skill: commit"), "got: {out}");
+    }
+
+    #[test]
+    fn attribution_skill_shows_badge() {
+        let s = parse_jsonl(
+            r#"{"type":"assistant","attributionSkill":"commit","message":{"content":[{"type":"text","text":"done"}]}}"#,
+        );
+        let out = joined(&s.entries, false);
+        assert!(out.contains("[skill:commit]"), "got: {out}");
+    }
+
+    #[test]
+    fn sidechain_hidden_by_default_shown_when_toggled() {
+        let s =
+            parse_jsonl(r#"{"type":"user","isSidechain":true,"message":{"content":"side task"}}"#);
+        assert!(!joined(&s.entries, false).contains("side task"));
+        assert!(joined(&s.entries, true).contains("side task"));
+    }
+
+    #[test]
+    fn meta_entries_are_never_rendered() {
+        let s = parse_jsonl(r#"{"type":"ai-title","aiTitle":"secret"}"#);
+        assert!(joined(&s.entries, true).is_empty());
+    }
+
+    #[test]
+    fn entries_are_ordered_by_timestamp_ascending() {
+        // 記録順は later→earlier だが、表示は timestamp 昇順になる (SPEC §6.2)。
+        let s = parse_jsonl(
+            "{\"type\":\"user\",\"timestamp\":\"2026-07-10T12:00:00Z\",\"message\":{\"content\":\"second\"}}\n\
+             {\"type\":\"user\",\"timestamp\":\"2026-07-10T09:00:00Z\",\"message\":{\"content\":\"first\"}}",
+        );
+        let out = joined(&s.entries, false);
+        let first_at = out.find("first").expect("first present");
+        let second_at = out.find("second").expect("second present");
+        assert!(
+            first_at < second_at,
+            "earlier timestamp should render first: {out}"
+        );
+    }
+
+    #[test]
+    fn empty_type_entry_gets_placeholder_kind_not_blank_row() {
+        // type 欠落の Unknown が空 kind ブロックになり継続ブロックと混同されるのを防ぐ (レビュー指摘 #1)。
+        let s = parse_jsonl(r#"{"foo":1}"#);
+        let blocks = build_blocks(&s.entries, false);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(text_of(&blocks[0].kind), "unknown");
+    }
+
+    #[test]
+    fn multiline_text_block_is_foldable() {
+        let s = parse_jsonl(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a\nb\nc"}]}}"#,
+        );
+        let blocks = build_blocks(&s.entries, false);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].is_foldable());
+        assert_eq!(blocks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn single_line_tool_use_is_not_foldable() {
+        let s = parse_jsonl(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/a"}}]}}"#,
+        );
+        let blocks = build_blocks(&s.entries, false);
+        assert_eq!(blocks.len(), 1);
+        assert!(!blocks[0].is_foldable());
+    }
+
+    #[test]
+    fn only_first_block_of_entry_carries_time_and_kind() {
+        // 2 つの content ブロックを持つエントリでは、2 つ目は継続ブロック (time/kind 空)。
+        let s = parse_jsonl(
+            r#"{"type":"assistant","timestamp":"2026-07-10T12:00:00Z","message":{"content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Read","input":{"file_path":"/a"}}]}}"#,
+        );
+        let blocks = build_blocks(&s.entries, false);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].time, "12:00:00");
+        assert_eq!(text_of(&blocks[0].kind), "Claude");
+        assert_eq!(blocks[1].time, "");
+        assert_eq!(text_of(&blocks[1].kind), "");
+    }
+
+    #[test]
+    fn empty_assistant_entry_produces_no_header() {
+        let s = parse_jsonl(r#"{"type":"assistant","message":{"content":[]}}"#);
+        assert!(joined(&s.entries, false).is_empty());
+    }
+
+    #[test]
+    fn format_unix_utc_known_epoch() {
+        // 2026-07-10T16:52:00Z = 1783702320
+        assert_eq!(format_unix_utc(1_783_702_320), "2026-07-10 16:52");
+        assert_eq!(format_unix_utc(0), "1970-01-01 00:00");
+    }
+}
