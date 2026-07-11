@@ -2,11 +2,15 @@
   "language": "japanese",
   "autoMemoryEnabled": false,
   "hooks": {
-    "PostToolUse": "Write|Edit",
-    "hooks": [
+    "PostToolUse": [
       {
-        "type": "command",
-        "command": "nix fmt"
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nix fmt 2>/dev/null || true"
+          }
+        ]
       }
     ]
   },
