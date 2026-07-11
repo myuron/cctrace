@@ -359,12 +359,7 @@ fn block_detail_lines(block: &ContentBlock) -> Vec<Line<'static>> {
 /// 先頭行に「種別 ×数 / 実行時間 / 状態」を出し、エラーがあれば 1 件 1 行で続ける
 /// (複数エラーは折りたたみ対象になる)。
 fn hook_lines(summary: &HookSummary) -> Vec<Line<'static>> {
-    // `stop_hook_summary` → `stop hook` のように読みやすい種別名にする。
-    let name = summary
-        .subtype
-        .trim_end_matches("_summary")
-        .replace('_', " ");
-    let name = if name.is_empty() { "hook".into() } else { name };
+    let name = &summary.name;
 
     // `hookCount` が欠落 (0) でも `hookInfos` があれば件数が判る。実行時間の件数で補い
     // 「×0 なのに実行時間が出る」不整合を避ける。
@@ -405,6 +400,10 @@ fn hook_lines(summary: &HookSummary) -> Vec<Line<'static>> {
             format!("  ↳ {err}"),
             Style::default().fg(Color::Red),
         )));
+    }
+    // フックが注入した内容 (折りたたみ行)。
+    for detail in &summary.details {
+        lines.push(dim_line(format!("  ↳ {detail}")));
     }
     lines
 }
@@ -578,6 +577,19 @@ mod tests {
         assert!(out.contains('⚡'), "hook marker missing: {out}");
         assert!(out.contains("stop hook"), "hook kind missing: {out}");
         assert!(out.contains("×2"), "hook count missing: {out}");
+    }
+
+    #[test]
+    fn hook_attachment_rendered_with_name_duration_and_details() {
+        let s = parse_jsonl(
+            "{\"type\":\"attachment\",\"attachment\":{\"type\":\"hook_success\",\"hookName\":\"PostToolUse:Write\",\"exitCode\":0,\"durationMs\":263}}\n\
+             {\"type\":\"attachment\",\"attachment\":{\"type\":\"hook_additional_context\",\"hookName\":\"PostToolUse:Edit\",\"content\":[\"fmt ran on /a/b.rs\"]}}",
+        );
+        let out = joined(&s.entries, false);
+        assert!(out.contains("⚡ PostToolUse:Write ×1"), "got: {out}");
+        assert!(out.contains("263ms"), "got: {out}");
+        assert!(out.contains("⚡ PostToolUse:Edit ×1"), "got: {out}");
+        assert!(out.contains("fmt ran on /a/b.rs"), "got: {out}");
     }
 
     #[test]

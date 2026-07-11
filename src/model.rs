@@ -62,18 +62,25 @@ pub enum Block {
 }
 
 /// フック実行サマリの構造化フィールド。cctrace の核 (Hook が意図通り起動したかの確認)。
+///
+/// 2 系統の記録元を吸収する:
+/// - `system` の `stop_hook_summary` (Stop フック)
+/// - `attachment` の `hook_*` (PostToolUse 等。フックが出力またはファイル変更した時に記録)
 #[derive(Debug, Clone, PartialEq)]
 pub struct HookSummary {
-    /// system の subtype (例: `stop_hook_summary`)。フック種別の識別に使う。
-    pub subtype: String,
-    /// 実行されたフック数 (`hookCount`)。
+    /// 表示名。system 系は subtype 由来 (例: "stop hook")、attachment 系は
+    /// hookName (例: "PostToolUse:Write")。
+    pub name: String,
+    /// 実行されたフック数 (`hookCount`)。attachment 系は 1 件 = 1 実行。
     pub hook_count: u64,
-    /// 各フックの実行時間 (`hookInfos[].durationMs`)。
+    /// 各フックの実行時間 (`hookInfos[].durationMs` / `durationMs`)。
     pub durations_ms: Vec<u64>,
-    /// フックが報告したエラー (`hookErrors`)。空なら正常。
+    /// フックが報告したエラー (`hookErrors` / 非 0 の `exitCode` + stderr)。空なら正常。
     pub errors: Vec<String>,
     /// フックが継続を阻止したか (`preventedContinuation`)。
     pub prevented_continuation: bool,
+    /// フックが注入した内容の要約 (`content`)。折りたたみ行として表示する。
+    pub details: Vec<String>,
 }
 
 impl EntryKind {
@@ -98,13 +105,7 @@ pub fn parse_entry(value: &Value) -> Entry {
             subtype: str_field(value, "subtype"),
             text: str_field(value, "content").or_else(|| str_field(value, "text")),
         },
-        "attachment" => EntryKind::Attachment {
-            attachment_type: value
-                .get("attachment")
-                .and_then(|a| a.get("type"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        },
+        "attachment" => parse_attachment(value),
         "ai-title"
         | "custom-title"
         | "last-prompt"
@@ -137,6 +138,71 @@ pub fn parse_entry(value: &Value) -> Entry {
     }
 }
 
+/// attachment エントリを解釈する。フック実行記録 (`attachment.type == "hook_*"`) は
+/// 専用の Hook 種別へ、それ以外は従来通り Attachment へ振り分ける。
+fn parse_attachment(value: &Value) -> EntryKind {
+    let attachment = value.get("attachment");
+    let attachment_type = attachment
+        .and_then(|a| a.get("type"))
+        .and_then(Value::as_str);
+    if let (Some(a), Some(t)) = (attachment, attachment_type)
+        && t.starts_with("hook_")
+    {
+        return EntryKind::Hook(parse_hook_attachment(a, t));
+    }
+    EntryKind::Attachment {
+        attachment_type: attachment_type.map(str::to_owned),
+    }
+}
+
+/// `hook_success` / `hook_error` / `hook_system_message` / `hook_additional_context` 等の
+/// attachment を `HookSummary` へ変換する。未知・欠落フィールドは既定値へ (SPEC §4.3)。
+fn parse_hook_attachment(attachment: &Value, attachment_type: &str) -> HookSummary {
+    let name = attachment
+        .get("hookName")
+        .and_then(Value::as_str)
+        .unwrap_or(attachment_type)
+        .to_owned();
+    // attachment 系は 1 記録 = 1 実行。durationMs は hook_success にのみ載る。
+    let durations_ms = attachment
+        .get("durationMs")
+        .and_then(Value::as_u64)
+        .into_iter()
+        .collect();
+    let mut errors = Vec::new();
+    if let Some(code) = attachment.get("exitCode").and_then(Value::as_i64)
+        && code != 0
+    {
+        let stderr = attachment
+            .get("stderr")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        errors.push(if stderr.is_empty() {
+            format!("exit code {code}")
+        } else {
+            one_line(stderr)
+        });
+    }
+    // content はフックが注入した内容 (文字列または文字列配列)。
+    let details = match attachment.get("content") {
+        Some(Value::String(s)) if !s.is_empty() => vec![one_line(s)],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(one_line)
+            .collect(),
+        _ => Vec::new(),
+    };
+    HookSummary {
+        name,
+        hook_count: 1,
+        durations_ms,
+        errors,
+        prevented_continuation: false,
+        details,
+    }
+}
+
 /// フック系 system エントリの構造化フィールドを `HookSummary` へ変換する。
 /// 未知・欠落フィールドは既定値にフォールバックする (前方互換、SPEC §4.3)。
 fn parse_hook_summary(value: &Value) -> HookSummary {
@@ -164,8 +230,12 @@ fn parse_hook_summary(value: &Value) -> HookSummary {
                 .collect()
         })
         .unwrap_or_default();
+    // `stop_hook_summary` → `stop hook` のように読みやすい表示名にする。
+    let subtype = str_field(value, "subtype").unwrap_or_default();
+    let name = subtype.trim_end_matches("_summary").replace('_', " ");
+    let name = if name.is_empty() { "hook".into() } else { name };
     HookSummary {
-        subtype: str_field(value, "subtype").unwrap_or_default(),
+        name,
         hook_count: value.get("hookCount").and_then(Value::as_u64).unwrap_or(0),
         durations_ms,
         errors,
@@ -173,6 +243,7 @@ fn parse_hook_summary(value: &Value) -> HookSummary {
             .get("preventedContinuation")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        details: Vec::new(),
     }
 }
 
@@ -417,11 +488,81 @@ mod tests {
         let EntryKind::Hook(h) = parse_entry(&v).kind else {
             panic!("expected hook");
         };
-        assert_eq!(h.subtype, "stop_hook_summary");
+        assert_eq!(h.name, "stop hook");
         assert_eq!(h.hook_count, 1);
         assert_eq!(h.durations_ms, vec![12690]);
         assert!(h.errors.is_empty());
         assert!(!h.prevented_continuation);
+    }
+
+    #[test]
+    fn parses_hook_success_attachment_into_hook_kind() {
+        // PostToolUse 等のフックが出力を持つと attachment.type == "hook_success" が記録される。
+        let v = json!({
+            "type": "attachment",
+            "attachment": {
+                "type": "hook_success",
+                "hookName": "PostToolUse:Write",
+                "hookEvent": "PostToolUse",
+                "stdout": "{}",
+                "stderr": "",
+                "exitCode": 0,
+                "durationMs": 263,
+                "content": "",
+            },
+        });
+        let EntryKind::Hook(h) = parse_entry(&v).kind else {
+            panic!("expected hook");
+        };
+        assert_eq!(h.name, "PostToolUse:Write");
+        assert_eq!(h.hook_count, 1);
+        assert_eq!(h.durations_ms, vec![263]);
+        assert!(h.errors.is_empty());
+        assert!(h.details.is_empty());
+    }
+
+    #[test]
+    fn hook_attachment_nonzero_exit_becomes_error() {
+        let v = json!({
+            "type": "attachment",
+            "attachment": {
+                "type": "hook_error",
+                "hookName": "PostToolUse:Edit",
+                "exitCode": 2,
+                "stderr": "boom",
+            },
+        });
+        let EntryKind::Hook(h) = parse_entry(&v).kind else {
+            panic!("expected hook");
+        };
+        assert_eq!(h.errors, vec!["boom".to_string()]);
+    }
+
+    #[test]
+    fn hook_additional_context_content_becomes_details() {
+        let v = json!({
+            "type": "attachment",
+            "attachment": {
+                "type": "hook_additional_context",
+                "hookName": "PostToolUse:Edit",
+                "hookEvent": "PostToolUse",
+                "content": ["PostToolUse hook modified /a/b.rs after your edit"],
+            },
+        });
+        let EntryKind::Hook(h) = parse_entry(&v).kind else {
+            panic!("expected hook");
+        };
+        assert_eq!(h.name, "PostToolUse:Edit");
+        assert_eq!(
+            h.details,
+            vec!["PostToolUse hook modified /a/b.rs after your edit".to_string()]
+        );
+    }
+
+    #[test]
+    fn non_hook_attachment_stays_attachment() {
+        let v = json!({"type": "attachment", "attachment": {"type": "task_reminder"}});
+        assert!(matches!(parse_entry(&v).kind, EntryKind::Attachment { .. }));
     }
 
     #[test]
