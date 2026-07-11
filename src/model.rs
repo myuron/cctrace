@@ -28,6 +28,9 @@ pub enum EntryKind {
         subtype: Option<String>,
         text: Option<String>,
     },
+    /// フック実行サマリ (`system` の `*_hook_summary`)。現状 transcript に構造的な
+    /// 痕跡を残すのは Stop フック (`stop_hook_summary`) のみ (SPEC §5.2)。
+    Hook(HookSummary),
     Attachment {
         attachment_type: Option<String>,
     },
@@ -58,6 +61,21 @@ pub enum Block {
     },
 }
 
+/// フック実行サマリの構造化フィールド。cctrace の核 (Hook が意図通り起動したかの確認)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookSummary {
+    /// system の subtype (例: `stop_hook_summary`)。フック種別の識別に使う。
+    pub subtype: String,
+    /// 実行されたフック数 (`hookCount`)。
+    pub hook_count: u64,
+    /// 各フックの実行時間 (`hookInfos[].durationMs`)。
+    pub durations_ms: Vec<u64>,
+    /// フックが報告したエラー (`hookErrors`)。空なら正常。
+    pub errors: Vec<String>,
+    /// フックが継続を阻止したか (`preventedContinuation`)。
+    pub prevented_continuation: bool,
+}
+
 impl EntryKind {
     /// 既定のタイムライン (主系列) で表示すべき種別か。メタ情報は既定で隠す。
     pub fn is_visible_by_default(&self) -> bool {
@@ -72,6 +90,10 @@ pub fn parse_entry(value: &Value) -> Entry {
     let kind = match type_name {
         "user" => EntryKind::User(parse_content(value)),
         "assistant" => EntryKind::Assistant(parse_content(value)),
+        // フック系 system は `hookCount` / `hookInfos` を持つ。専用種別に振り分ける。
+        "system" if value.get("hookCount").is_some() || value.get("hookInfos").is_some() => {
+            EntryKind::Hook(parse_hook_summary(value))
+        }
         "system" => EntryKind::System {
             subtype: str_field(value, "subtype"),
             text: str_field(value, "content").or_else(|| str_field(value, "text")),
@@ -112,6 +134,45 @@ pub fn parse_entry(value: &Value) -> Entry {
             .unwrap_or(false),
         attribution_skill: str_field(value, "attributionSkill"),
         kind,
+    }
+}
+
+/// フック系 system エントリの構造化フィールドを `HookSummary` へ変換する。
+/// 未知・欠落フィールドは既定値にフォールバックする (前方互換、SPEC §4.3)。
+fn parse_hook_summary(value: &Value) -> HookSummary {
+    let durations_ms = value
+        .get("hookInfos")
+        .and_then(Value::as_array)
+        .map(|infos| {
+            infos
+                .iter()
+                .filter_map(|i| i.get("durationMs").and_then(Value::as_u64))
+                .collect()
+        })
+        .unwrap_or_default();
+    let errors = value
+        .get("hookErrors")
+        .and_then(Value::as_array)
+        .map(|errs| {
+            errs.iter()
+                // 文字列ならそのまま、そうでなければ JSON 表現に畳んで捨てない。
+                .map(|e| {
+                    e.as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| e.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    HookSummary {
+        subtype: str_field(value, "subtype").unwrap_or_default(),
+        hook_count: value.get("hookCount").and_then(Value::as_u64).unwrap_or(0),
+        durations_ms,
+        errors,
+        prevented_continuation: value
+            .get("preventedContinuation")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -341,6 +402,54 @@ mod tests {
     fn one_line_strips_control_chars_and_flattens_whitespace() {
         // ESC/BEL 等の制御文字は除去、改行・タブ・連続空白は 1 個の空白に畳む。
         assert_eq!(one_line("a\x1bb\x07c\td\n\ne"), "abc d e");
+    }
+
+    #[test]
+    fn parses_stop_hook_summary_into_hook_kind() {
+        let v = json!({
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 1,
+            "hookInfos": [{"command": "x", "promptText": "x", "durationMs": 12690}],
+            "hookErrors": [],
+            "preventedContinuation": false,
+        });
+        let EntryKind::Hook(h) = parse_entry(&v).kind else {
+            panic!("expected hook");
+        };
+        assert_eq!(h.subtype, "stop_hook_summary");
+        assert_eq!(h.hook_count, 1);
+        assert_eq!(h.durations_ms, vec![12690]);
+        assert!(h.errors.is_empty());
+        assert!(!h.prevented_continuation);
+    }
+
+    #[test]
+    fn hook_errors_and_prevented_continuation_are_captured() {
+        let v = json!({
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 2,
+            "hookErrors": ["boom", "kaboom"],
+            "preventedContinuation": true,
+        });
+        let EntryKind::Hook(h) = parse_entry(&v).kind else {
+            panic!("expected hook");
+        };
+        assert_eq!(h.errors, vec!["boom".to_string(), "kaboom".to_string()]);
+        assert!(h.prevented_continuation);
+    }
+
+    #[test]
+    fn plain_system_without_hook_fields_stays_system() {
+        let v = json!({"type": "system", "subtype": "turn_duration", "content": "1.2s"});
+        assert!(matches!(parse_entry(&v).kind, EntryKind::System { .. }));
+    }
+
+    #[test]
+    fn hook_kind_is_visible_by_default() {
+        let v = json!({"type": "system", "subtype": "stop_hook_summary", "hookCount": 1});
+        assert!(parse_entry(&v).kind.is_visible_by_default());
     }
 
     #[test]

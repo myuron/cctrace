@@ -20,11 +20,13 @@ Hook や Skill が意図したタイミングで起動しているかを確認�
 - **入力モード**: 過去セッション閲覧（静的ビューア）。実行中ファイルの監視・追従は**行わない**。
 - **表示の焦点**: 会話タイムライン主体。その中で **Skill 起動**をハイライトする。
 - **対象範囲**: cctrace を起動した作業ディレクトリ (cwd) に対応するプロジェクトのセッションのみ。
-- **MVP は Skill 可視化まで。** Hook 検出は MVP 対象外とし、将来拡張とする（§5.2 / §10 参照）。
+- **Skill 可視化に加え、構造的に検出可能な Hook（Stop フック）を可視化する。**
+  transcript に構造化フィールドが現れる Hook のみを対象とする（§5.2）。
 
 ### 非対象 (Non-Goals)
 
-- **Hook 起動の検出・可視化**（transcript に構造的な痕跡が無いため。将来拡張・§5.2）
+- **PostToolUse / PreToolUse / UserPromptSubmit 等の Hook 検出**（transcript に
+  構造的な痕跡が無いため確実な判定が不可能。§5.2）
 - 実行中セッションのリアルタイム追従（tail 監視）
 - 複数プロジェクト横断のセッション閲覧
 - セッションの編集・削除・再生などの書き込み操作
@@ -89,18 +91,27 @@ Hook や Skill が意図したタイミングで起動しているかを確認�
   → 「どの Skill がどの操作を駆動したか」を確実に追跡・可視化できる。
 - 利用可能な Skill 一覧は `attachment.type == "skill_listing"` に載る。
 
-### 5.2 Hook 起動 — MVP 対象外（将来拡張）
+### 5.2 Hook 起動 — Stop フックのみ構造的に検出可能
 
-- **実データ調査の結果、transcript に Hook を示す構造化フィールドは存在しない。**
-  `"hook"` の文字列は user/assistant/attachment の**本文テキスト中**にしか現れない。
-- したがって cctrace 単体で「Hook が起動したか」を確実に判定する手段は現状無い。
-- **決定: Hook 検出は MVP に含めない。** まず構造的に確実な Skill 可視化を完成させる。
-- 将来拡張時に取りうる方式（実装前に別途検証・合意する）:
-  1. テキスト一致のヒューリスティックで「Hook らしき注入」を推測表示する
-     （信頼性は低く、誤検出・見逃しがありうる。断定表示はしない）。
-  2. `~/.claude/settings.json` の hook 定義や別の Hook 実行ログと突き合わせる
+- **再調査（Claude Code v2.1.204）の結果、Stop フックは transcript に構造化された
+  痕跡を残すことが判明した。** `type == "system"` かつ `subtype == "stop_hook_summary"`
+  のエントリが、以下のフィールドを持つ:
+  - `hookCount`: 実行されたフック数
+  - `hookInfos[]`: 各フックの情報（`durationMs` 等）
+  - `hookErrors[]`: フックが報告したエラー（空なら正常）
+  - `preventedContinuation`: フックが継続を阻止したか
+  - `level` / `hasOutput` / `toolUseID` など
+- **これにより「Stop フックが起動したか・実行時間・エラー・継続阻止」を確実に
+  可視化できる。** cctrace はこれを専用のタイムライン種別 (`EntryKind::Hook`) として
+  parse し、⚡ 付きで強調表示する。
+- **一方、PostToolUse / PreToolUse / UserPromptSubmit 等の他イベントは、
+  実データ全プロジェクトを走査しても構造化された system エントリを残さない**
+  （`"PostToolUse"` 等の文字列は本文テキスト中にのみ現れる）。したがってこれらの
+  Hook 起動を cctrace 単体で確実に判定する手段は現状無く、**対象外**とする（§2）。
+- 上記イベントを将来対象化する場合に取りうる方式（実装前に別途検証・合意する）:
+  1. `~/.claude/settings.json` の hook 定義や別の Hook 実行ログと突き合わせる
      （データソース追加が必要。スコープ拡大）。
-  3. Hook 側で systemMessage 等を注入し、transcript に痕跡を残す運用にする。
+  2. Hook 側で systemMessage 等を注入し、transcript に痕跡を残す運用にする。
 
 ## 6. 機能要件
 
@@ -132,16 +143,17 @@ Hook や Skill が意図したタイミングで起動しているかを確認�
 
 ## 7. エントリ描画ルール（MVP）
 
-| type / 内容                       | 表示                                                             |
-| --------------------------------- | ---------------------------------------------------------------- |
-| `user` (text)                     | ユーザー発話として表示                                           |
-| `assistant` text                  | アシスタント応答                                                 |
-| `assistant` thinking              | 思考。折りたたみ or 淡色で区別（案）                             |
-| `assistant` tool_use              | ツール名 + 主要 input を1行要約。`Skill` は強調                  |
-| `attributionSkill` 付き           | 「Skill 由来」バッジを付与                                       |
-| `attachment` (skill_listing 等)   | 種別を短く表示（詳細は折りたたみ、案）                           |
-| `system`                          | 補助情報として淡色表示（`turn_duration` 等は集約 or 非表示、案） |
-| メタ系 (ai-title/mode/pr-link 等) | MVP 非表示（将来拡張）                                           |
+| type / 内容                       | 表示                                                                       |
+| --------------------------------- | -------------------------------------------------------------------------- |
+| `user` (text)                     | ユーザー発話として表示                                                     |
+| `assistant` text                  | アシスタント応答                                                           |
+| `assistant` thinking              | 思考。折りたたみ or 淡色で区別（案）                                       |
+| `assistant` tool_use              | ツール名 + 主要 input を1行要約。`Skill` は強調                            |
+| `attributionSkill` 付き           | 「Skill 由来」バッジを付与                                                 |
+| `attachment` (skill_listing 等)   | 種別を短く表示（詳細は折りたたみ、案）                                     |
+| `system` (hook summary)           | フック実行として ⚡ で強調。種別・実行数・実行時間・エラー・継続阻止を表示 |
+| `system` (その他)                 | 補助情報として淡色表示（`turn_duration` 等は集約 or 非表示、案）           |
+| メタ系 (ai-title/mode/pr-link 等) | MVP 非表示（将来拡張）                                                     |
 
 木構造 (`parentUuid`) の扱い:
 
@@ -170,7 +182,8 @@ Hook や Skill が意図したタイミングで起動しているかを確認�
 
 **決定済み**:
 
-- Hook 検出は MVP 対象外（§2 / §5.2）。将来拡張として扱う。
+- Stop フック（`stop_hook_summary`）は構造的に検出可能なため可視化対象（§5.2）。
+  PostToolUse 等の他イベントは痕跡が無いため対象外（§2 / §5.2）。
 - 木構造は既定で線形化。分岐・サイドチェーンは ON/OFF 切替オプション（§7）。
 
 残りの検討事項:
