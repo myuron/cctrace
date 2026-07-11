@@ -1,6 +1,9 @@
 # rust
 /target
 
+# nix build result
+/result
+
 # direnv
 .envrc
 .direnv/
