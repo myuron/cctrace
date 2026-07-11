@@ -8,7 +8,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "nix fmt 2>/dev/null || true"
+            "command": "nix fmt 2>/dev/null || true; echo '{\"systemMessage\":\"nix fmt hook fired\"}'"
           }
         ]
       }
