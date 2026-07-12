@@ -110,14 +110,11 @@ impl OpenSession {
         }
     }
 
-    /// 選択中ブロックが折りたたみ対象なら展開/折りたたみをトグルする。
+    /// 選択中ブロックの展開/折りたたみをトグルする。折りたたみ可否は Detail 列の幅
+    /// (描画時にしか判らない) に依存するため、ここでは無条件にトグルする。折りたたみ
+    /// 対象でないブロックではこのフラグは描画時に無視され、見た目は変わらない。
     fn toggle_selected(&mut self) {
-        if self
-            .blocks
-            .get(self.selected)
-            .is_some_and(ui::TimelineBlock::is_foldable)
-            && let Some(e) = self.expanded.get_mut(self.selected)
-        {
+        if let Some(e) = self.expanded.get_mut(self.selected) {
             *e = !*e;
         }
     }
@@ -319,8 +316,9 @@ mod tests {
     }
 
     #[test]
-    fn enter_toggles_fold_of_foldable_block_only() {
-        // block0: 複数行 (折りたたみ対象)、block1: 単一行 (非対象)。
+    fn enter_toggles_expanded_of_selected_block() {
+        // 折りたたみ可否は Detail 幅依存 (描画時にしか判らない) なので、Enter は選択中
+        // ブロックの展開フラグを無条件にトグルする。
         let jsonl = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"a\\nb\"}]}}\n\
                      {\"type\":\"user\",\"message\":{\"content\":\"single\"}}";
         let mut app = App::new(vec![]);
@@ -331,10 +329,10 @@ mod tests {
         assert!(app.open.as_ref().unwrap().expanded[0]);
         app.handle(Action::Enter); // 折りたたみに戻す
         assert!(!app.open.as_ref().unwrap().expanded[0]);
-        // 単一行ブロックは Enter で状態が変わらない。
+        // 別ブロックへ移動しても同様にトグルできる。
         app.handle(Action::Down);
         app.handle(Action::Enter);
-        assert!(!app.open.as_ref().unwrap().expanded[1]);
+        assert!(app.open.as_ref().unwrap().expanded[1]);
     }
 
     #[test]
