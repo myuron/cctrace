@@ -9,6 +9,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Screen};
 use crate::model::{Block as ContentBlock, Entry, EntryKind, HookSummary};
@@ -16,6 +17,14 @@ use crate::model::{Block as ContentBlock, Entry, EntryKind, HookSummary};
 const SKILL_COLOR: Color = Color::Magenta;
 /// フック起動を目立たせる色。Skill(Magenta)/tool(Yellow) 等と混ざらない色を選ぶ。
 const HOOK_COLOR: Color = Color::LightBlue;
+
+/// タイムライン表の Time 列幅 (`draw_timeline` の Constraint と一致させる)。
+const TIME_COL_WIDTH: u16 = 8;
+/// タイムライン表の Kind 列幅 (同上)。
+const KIND_COL_WIDTH: u16 = 10;
+/// Detail 列以外がテーブル内で消費する幅。選択記号 (▶ ＝2)、列間スペース×2、
+/// Time/Kind 列の合計。Detail 列の折り返し幅を求めるために描画側と共有する。
+const NON_DETAIL_WIDTH: u16 = 2 + 2 + TIME_COL_WIDTH + KIND_COL_WIDTH;
 
 /// 現在の画面に応じて全体を描画する。スクロール上限は viewport 依存のためここで確定する。
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -107,6 +116,10 @@ fn draw_timeline(frame: &mut Frame, app: &mut App) {
     // ブロックはキャッシュ済み (OpenSession)。展開状態に応じて可視行へ平坦化する。
     // 再描画はキー入力駆動 (main のイベントループ) なので、入力ごとに 1 度だけ
     // 平坦化するコストは無視できる。選択ブロックの先頭行の位置も併せて求める。
+    // Detail 列の実効幅。枠線 (2) と選択記号・列間・Time/Kind 列 (NON_DETAIL_WIDTH) を
+    // 差し引いた残り。ここへ折り返してクリップされない全文表示にする。
+    let detail_width = areas[1].width.saturating_sub(2 + NON_DETAIL_WIDTH) as usize;
+
     let mut rows: Vec<Row> = Vec::new();
     let mut selected_row = 0usize;
     for (i, block) in open.blocks.iter().enumerate() {
@@ -114,12 +127,12 @@ fn draw_timeline(frame: &mut Frame, app: &mut App) {
             selected_row = rows.len();
         }
         let expanded = open.expanded.get(i).copied().unwrap_or(false);
-        rows.extend(block_rows(block, expanded));
+        rows.extend(block_rows(block, expanded, detail_width));
     }
 
     let widths = [
-        Constraint::Length(8),
-        Constraint::Length(10),
+        Constraint::Length(TIME_COL_WIDTH),
+        Constraint::Length(KIND_COL_WIDTH),
         Constraint::Min(10),
     ];
     let header = Row::new(["Time", "Kind", "Detail"]).style(
@@ -155,8 +168,8 @@ fn draw_timeline(frame: &mut Frame, app: &mut App) {
 /// ハイライトや折りたたみ判定を単体テストできるようにする。
 ///
 /// 同一エントリの 2 ブロック目以降は time/kind を空にして表を詰め、kind 列が
-/// 埋まっている行が新しいエントリの先頭であることを示す。`lines` が 2 行以上なら
-/// 折りたたみ対象 (`is_foldable`)。
+/// 埋まっている行が新しいエントリの先頭であることを示す。折りたたみ可否は Detail 幅への
+/// 折り返し後の表示行数で決まる (`block_rows`) ため、ここでは幅非依存の論理行のみ持つ。
 #[derive(Debug, Clone)]
 pub struct TimelineBlock {
     time: String,
@@ -170,11 +183,6 @@ impl TimelineBlock {
     /// フック起動を表すブロックか (発見性向上のジャンプ・集計に用いる)。
     pub fn is_hook(&self) -> bool {
         self.is_hook
-    }
-
-    /// 2 行以上を持つブロックは折りたたみ対象。1 行のブロックは常に全表示。
-    pub fn is_foldable(&self) -> bool {
-        self.lines.len() >= 2
     }
 }
 
@@ -301,35 +309,101 @@ fn push_message_blocks(
     }
 }
 
-/// 1 ブロックを可視行 (Row) へ展開する。折りたたみ対象は既定で先頭行のみ表示し
-/// 折りたたみマーカー `[+N]` を付ける。`expanded` のとき全行を出し `[-]` を付ける。
-/// 継続行は time/kind を空にして表を詰める。
-fn block_rows(block: &TimelineBlock, expanded: bool) -> Vec<Row<'static>> {
-    let foldable = block.is_foldable();
-    let mut head = block.lines[0].clone();
+/// 1 ブロックを可視行 (Row) へ展開する。Detail 列は横幅でクリップされる (Table は
+/// 折り返さない) ため、`detail_width` で明示的に折り返してから行にする。折り返し後が
+/// 2 行以上なら折りたたみ対象で、既定は先頭行のみ表示しマーカー `[+N]` を付ける。
+/// `expanded` のとき全行を出し `[-]` を付ける。継続行は time/kind を空にして表を詰める。
+fn block_rows(block: &TimelineBlock, expanded: bool, detail_width: usize) -> Vec<Row<'static>> {
+    // 各論理行を Detail 幅へ折り返した全表示行 (折りたたみ前)。
+    let mut display = wrapped_lines(block, detail_width);
+
+    let foldable = display.len() >= 2;
+    let mut head = display.remove(0);
     if foldable {
-        let marker = if expanded {
-            Span::styled(" [-]", dim_style())
+        // マーカーぶんの幅を確保する。先頭行が満杯だとマーカーがクリップされ折りたたみ
+        // の手掛かりが消えるため、必要なときだけ先頭行を再折り返しして末尾を後続へ回す。
+        // 予約幅は再折り返し前の件数で見積もる (件数の桁が増えても内容は失われない)。
+        let reserve = if expanded {
+            " [-]".width()
         } else {
-            Span::styled(format!(" [+{}]", block.lines.len() - 1), dim_style())
+            format!(" [+{}]", display.len()).width()
         };
-        head.spans.push(marker);
+        if head.width() + reserve > detail_width {
+            let mut pieces = wrap_line(&head, detail_width.saturating_sub(reserve)).into_iter();
+            head = pieces.next().unwrap_or_else(|| Line::from(""));
+            for (offset, extra) in pieces.enumerate() {
+                display.insert(offset, extra);
+            }
+        }
+        // マーカーは再折り返し後の隠れ行数で表示する (先頭行が割れた分も数える)。
+        let marker_text = if expanded {
+            " [-]".to_string()
+        } else {
+            format!(" [+{}]", display.len())
+        };
+        head.spans.push(Span::styled(marker_text, dim_style()));
     }
+
     let mut rows = vec![Row::new(vec![
         Cell::from(block.time.clone()),
         Cell::from(block.kind.clone()),
         Cell::from(head),
     ])];
     if foldable && expanded {
-        for line in &block.lines[1..] {
+        for line in display {
             rows.push(Row::new(vec![
                 Cell::from(String::new()),
                 Cell::from(Line::from("")),
-                Cell::from(line.clone()),
+                Cell::from(line),
             ]));
         }
     }
     rows
+}
+
+/// ブロックの全論理行を Detail 幅 `detail_width` で折り返した表示行列 (折りたたみ前)。
+/// 行数が 2 以上なら折りたたみ対象になる。
+fn wrapped_lines(block: &TimelineBlock, detail_width: usize) -> Vec<Line<'static>> {
+    block
+        .lines
+        .iter()
+        .flat_map(|l| wrap_line(l, detail_width))
+        .collect()
+}
+
+/// スタイル付きの 1 行を表示幅 `width` で折り返す (全角は 2 幅として数える)。
+/// Table は折り返さずクリップするだけなので、全文を確認できるようここで分割する。
+/// `width` が 0 のときは分割せずそのまま返す (退化ケース、極小端末)。
+fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![line.clone()];
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_width = 0usize;
+    for span in &line.spans {
+        let style = span.style;
+        let mut buf = String::new();
+        for ch in span.content.chars() {
+            let cw = ch.width().unwrap_or(0);
+            // 1 行に載り切らない位置で改行する。行頭 (cur_width==0) では 1 文字が幅を
+            // 超えても改行しない (無限ループ回避。極端に狭い幅での軽微なはみ出しは許容)。
+            if cur_width + cw > width && cur_width > 0 {
+                if !buf.is_empty() {
+                    cur.push(Span::styled(std::mem::take(&mut buf), style));
+                }
+                out.push(Line::from(std::mem::take(&mut cur)));
+                cur_width = 0;
+            }
+            buf.push(ch);
+            cur_width += cw;
+        }
+        if !buf.is_empty() {
+            cur.push(Span::styled(buf, style));
+        }
+    }
+    out.push(Line::from(cur));
+    out
 }
 
 fn block_detail_lines(block: &ContentBlock) -> Vec<Line<'static>> {
@@ -638,7 +712,7 @@ mod tests {
         );
         let blocks = build_blocks(&s.entries, false);
         assert_eq!(blocks.len(), 1);
-        assert!(!blocks[0].is_foldable(), "command should be inline");
+        assert_eq!(blocks[0].lines.len(), 1, "command should be inline");
         assert!(text_of(&blocks[0].lines[0]).contains("nix fmt"));
 
         // content 1 件だけの hook_system_message は内容が先頭行に載り、折りたたみ無し。
@@ -647,7 +721,7 @@ mod tests {
         );
         let blocks = build_blocks(&s.entries, false);
         assert_eq!(blocks.len(), 1);
-        assert!(!blocks[0].is_foldable(), "single detail should be inline");
+        assert_eq!(blocks[0].lines.len(), 1, "single detail should be inline");
         assert!(text_of(&blocks[0].lines[0]).contains("nix fmt hook fired"));
     }
 
@@ -727,8 +801,8 @@ mod tests {
         );
         let blocks = build_blocks(&s.entries, false);
         assert_eq!(blocks.len(), 1);
-        assert!(blocks[0].is_foldable());
-        assert_eq!(blocks[0].lines.len(), 3);
+        // 十分広い幅では折り返しが起きず、論理行数がそのまま折りたたみ対象判定になる。
+        assert_eq!(wrapped_lines(&blocks[0], 200).len(), 3);
     }
 
     #[test]
@@ -738,7 +812,81 @@ mod tests {
         );
         let blocks = build_blocks(&s.entries, false);
         assert_eq!(blocks.len(), 1);
-        assert!(!blocks[0].is_foldable());
+        assert_eq!(wrapped_lines(&blocks[0], 200).len(), 1);
+    }
+
+    #[test]
+    fn wrap_line_splits_by_display_width_keeping_all_content() {
+        let line = Line::from("abcdefghij");
+        let wrapped = wrap_line(&line, 4);
+        // 幅 4 で 10 文字 → 4 + 4 + 2。
+        assert_eq!(wrapped.len(), 3);
+        for l in &wrapped {
+            assert!(l.width() <= 4, "line exceeds width: {:?}", text_of(l));
+        }
+        let joined: String = wrapped.iter().map(text_of).collect();
+        assert_eq!(joined, "abcdefghij", "wrapping must not drop content");
+    }
+
+    #[test]
+    fn wrap_line_counts_fullwidth_as_two_columns() {
+        // 全角 3 文字 (幅 6) を幅 4 で折り返すと 2 文字 + 1 文字。
+        let line = Line::from("あいう");
+        let wrapped = wrap_line(&line, 4);
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(text_of(&wrapped[0]), "あい");
+        assert_eq!(text_of(&wrapped[1]), "う");
+    }
+
+    #[test]
+    fn expanded_timeline_renders_long_line_without_clipping() {
+        // draw で決まる Detail 幅への折り返しが実幅を超えないこと (超えるとクリップされ
+        // 文字が失われる) を、実描画バッファで検証する。
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let text = "z".repeat(150);
+        let s = parse_jsonl(&format!(
+            r#"{{"type":"user","message":{{"content":"{text}"}}}}"#
+        ));
+        let mut app = App::new(vec![]);
+        app.screen = Screen::Timeline;
+        app.open = Some(crate::app::open_session_for_test("s", s));
+        app.handle(crate::app::Action::Enter); // 選択ブロックを展開
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // ヘッダ・ヒントに 'z' は無いので、全 150 文字が見えていればクリップされていない。
+        let z_count = rendered.chars().filter(|&c| c == 'z').count();
+        assert_eq!(
+            z_count, 150,
+            "long line must not be clipped: found {z_count}"
+        );
+    }
+
+    #[test]
+    fn long_single_logical_line_becomes_foldable_when_wrapped() {
+        // 改行を含まない長い 1 行 (これまで横クリップで続きが見えなかったケース)。
+        let text = "z".repeat(120);
+        let s = parse_jsonl(&format!(
+            r#"{{"type":"user","message":{{"content":"{text}"}}}}"#
+        ));
+        let blocks = build_blocks(&s.entries, false);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lines.len(), 1, "改行が無いので論理行は 1 行");
+        // 狭い Detail 幅では折り返されて折りたたみ対象になり、全文を再構成できる。
+        let wrapped = wrapped_lines(&blocks[0], 40);
+        assert!(wrapped.len() >= 2, "narrow width should fold the long line");
+        let joined: String = wrapped.iter().map(text_of).collect();
+        assert_eq!(joined, text, "expanding must reveal the whole line");
     }
 
     #[test]
