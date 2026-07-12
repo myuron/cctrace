@@ -11,9 +11,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table};
 
 use crate::app::{App, Screen};
-use crate::model::{Block as ContentBlock, Entry, EntryKind};
+use crate::model::{Block as ContentBlock, Entry, EntryKind, HookSummary};
 
 const SKILL_COLOR: Color = Color::Magenta;
+/// フック起動を目立たせる色。Skill(Magenta)/tool(Yellow) 等と混ざらない色を選ぶ。
+const HOOK_COLOR: Color = Color::LightBlue;
 
 /// 現在の画面に応じて全体を描画する。スクロール上限は viewport 依存のためここで確定する。
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -84,11 +86,14 @@ fn draw_timeline(frame: &mut Frame, app: &mut App) {
         return;
     };
 
+    // フック起動数はツールの核 (フックが起動したかの確認)。ヘッダに常時出す。
+    let hook_count = open.blocks.iter().filter(|b| b.is_hook()).count();
     let header = format!(
-        " {}   entries: {}{}   branches: {}",
+        " {}   entries: {}{}   hooks: {}   branches: {}",
         open.meta.id,
         open.data.entries.len(),
         skipped_suffix(open.data.skipped_lines),
+        hook_count,
         if app.show_branches { "on" } else { "off" },
     );
     frame.render_widget(
@@ -139,7 +144,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App) {
 
     frame.render_widget(
         hint_line(
-            "↑/↓ or j/k: 選択   Enter: 開閉   g/G: 先頭/末尾   b: 分岐表示   Esc: 一覧   q: 終了",
+            "↑/↓ or j/k: 選択   Enter: 開閉   g/G: 先頭/末尾   h/H: フック   b: 分岐表示   Esc: 一覧   q: 終了",
         ),
         areas[2],
     );
@@ -157,9 +162,16 @@ pub struct TimelineBlock {
     time: String,
     kind: Line<'static>,
     lines: Vec<Line<'static>>,
+    /// フック起動ブロックか。ヘッダのフック数集計と `h`/`H` ジャンプに使う。
+    is_hook: bool,
 }
 
 impl TimelineBlock {
+    /// フック起動を表すブロックか (発見性向上のジャンプ・集計に用いる)。
+    pub fn is_hook(&self) -> bool {
+        self.is_hook
+    }
+
     /// 2 行以上を持つブロックは折りたたみ対象。1 行のブロックは常に全表示。
     pub fn is_foldable(&self) -> bool {
         self.lines.len() >= 2
@@ -204,6 +216,18 @@ fn entry_blocks(entry: &Entry, blocks: &mut Vec<TimelineBlock>) {
                 time,
                 kind: dim_line("system"),
                 lines: vec![dim_line(label)],
+                is_hook: false,
+            });
+        }
+        EntryKind::Hook(summary) => {
+            blocks.push(TimelineBlock {
+                time,
+                kind: Line::from(Span::styled(
+                    "hook",
+                    Style::default().fg(HOOK_COLOR).add_modifier(Modifier::BOLD),
+                )),
+                lines: hook_lines(summary),
+                is_hook: true,
             });
         }
         EntryKind::Attachment { attachment_type } => {
@@ -212,6 +236,7 @@ fn entry_blocks(entry: &Entry, blocks: &mut Vec<TimelineBlock>) {
                 time,
                 kind: dim_line("attachment"),
                 lines: vec![dim_line(label)],
+                is_hook: false,
             });
         }
         EntryKind::Unknown { type_name } => {
@@ -226,6 +251,7 @@ fn entry_blocks(entry: &Entry, blocks: &mut Vec<TimelineBlock>) {
                 time,
                 kind: dim_line(label),
                 lines: vec![Line::from("")],
+                is_hook: false,
             });
         }
         EntryKind::Meta { .. } => {}
@@ -270,6 +296,7 @@ fn push_message_blocks(
             time: if i == 0 { time.clone() } else { String::new() },
             kind: if i == 0 { kind.clone() } else { Line::from("") },
             lines,
+            is_hook: false,
         });
     }
 }
@@ -325,6 +352,93 @@ fn block_detail_lines(block: &ContentBlock) -> Vec<Line<'static>> {
         ContentBlock::ToolResult { summary } => {
             vec![dim_line(format!("↳ result: {summary}"))]
         }
+    }
+}
+
+/// フック実行サマリを行へ展開する (cctrace の核: フックが意図通り起動したかの確認)。
+/// 先頭行に「種別 ×数 / 実行時間 / 状態」を出し、エラーがあれば 1 件 1 行で続ける
+/// (複数エラーは折りたたみ対象になる)。
+fn hook_lines(summary: &HookSummary) -> Vec<Line<'static>> {
+    let name = &summary.name;
+
+    // `hookCount` が欠落 (0) でも `hookInfos` があれば件数が判る。実行時間の件数で補い
+    // 「×0 なのに実行時間が出る」不整合を避ける。
+    let count = if summary.hook_count == 0 {
+        summary.durations_ms.len() as u64
+    } else {
+        summary.hook_count
+    };
+    // 1 実行の ×1 はノイズなので、複数実行時のみ件数を出す。
+    let head_label = if count > 1 {
+        format!("⚡ {name} ×{count}")
+    } else {
+        format!("⚡ {name}")
+    };
+    let mut spans = vec![Span::styled(
+        head_label,
+        Style::default().fg(HOOK_COLOR).add_modifier(Modifier::BOLD),
+    )];
+
+    // 「どのフックが発火したか」を先頭行で判別できるよう、コマンド (優先) または
+    // 最初の注入内容をインラインで載せる。残りの注入内容は折りたたみ行に回す。
+    let mut details: &[String] = &summary.details;
+    let inline = if summary.command.is_some() {
+        summary.command.clone()
+    } else if let Some((first, rest)) = details.split_first() {
+        details = rest;
+        Some(first.clone())
+    } else {
+        None
+    };
+    if let Some(info) = inline {
+        spans.push(Span::styled(
+            format!("  {}", truncate_chars(&info, 60)),
+            dim_style(),
+        ));
+    }
+
+    let total_ms: u64 = summary.durations_ms.iter().sum();
+    if !summary.durations_ms.is_empty() {
+        spans.push(Span::styled(format!("  {total_ms}ms"), dim_style()));
+    }
+
+    // 状態: エラー > 継続阻止 > 正常。異常は赤で強調する。
+    let status = if !summary.errors.is_empty() {
+        Span::styled(
+            format!("  ✗ {} error(s)", summary.errors.len()),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else if summary.prevented_continuation {
+        Span::styled(
+            "  ⛔ blocked",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("  ✓ ok", Style::default().fg(Color::Green))
+    };
+    spans.push(status);
+
+    let mut lines = vec![Line::from(spans)];
+    for err in &summary.errors {
+        lines.push(Line::from(Span::styled(
+            format!("  ↳ {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    // フックが注入した内容の残り (折りたたみ行)。
+    for detail in details {
+        lines.push(dim_line(format!("  ↳ {detail}")));
+    }
+    lines
+}
+
+/// インライン表示用に文字数上限で切り詰める (長いコマンドが行を占有しないように)。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…")
+    } else {
+        s.to_owned()
     }
 }
 
@@ -468,6 +582,103 @@ mod tests {
         );
         let out = joined(&s.entries, false);
         assert!(out.contains("[skill:commit]"), "got: {out}");
+    }
+
+    #[test]
+    fn only_hook_block_is_flagged_is_hook() {
+        let s = parse_jsonl(
+            "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n\
+             {\"type\":\"system\",\"subtype\":\"stop_hook_summary\",\"hookCount\":1}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"yo\"}]}}",
+        );
+        let blocks = build_blocks(&s.entries, false);
+        let hook_count = blocks.iter().filter(|b| b.is_hook()).count();
+        assert_eq!(hook_count, 1, "exactly one hook block expected");
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b.is_hook() && text_of(&b.kind) == "hook"),
+            "the hook block should carry the hook kind label"
+        );
+    }
+
+    #[test]
+    fn hook_summary_is_rendered_with_marker_and_count() {
+        let s = parse_jsonl(
+            r#"{"type":"system","subtype":"stop_hook_summary","hookCount":2,"hookInfos":[{"durationMs":100},{"durationMs":50}],"hookErrors":[],"preventedContinuation":false}"#,
+        );
+        let out = joined(&s.entries, false);
+        assert!(out.contains('⚡'), "hook marker missing: {out}");
+        assert!(out.contains("stop hook"), "hook kind missing: {out}");
+        assert!(out.contains("×2"), "hook count missing: {out}");
+    }
+
+    #[test]
+    fn hook_attachment_rendered_with_name_duration_and_details() {
+        let s = parse_jsonl(
+            "{\"type\":\"attachment\",\"attachment\":{\"type\":\"hook_success\",\"hookName\":\"PostToolUse:Write\",\"exitCode\":0,\"durationMs\":263,\"command\":\"nix fmt 2>/dev/null || true\"}}\n\
+             {\"type\":\"attachment\",\"attachment\":{\"type\":\"hook_additional_context\",\"hookName\":\"PostToolUse:Edit\",\"content\":[\"fmt ran on /a/b.rs\"]}}",
+        );
+        let out = joined(&s.entries, false);
+        assert!(out.contains("⚡ PostToolUse:Write"), "got: {out}");
+        assert!(out.contains("263ms"), "got: {out}");
+        assert!(out.contains("⚡ PostToolUse:Edit"), "got: {out}");
+        assert!(out.contains("fmt ran on /a/b.rs"), "got: {out}");
+        // どのフックかを示すコマンドが表示される。
+        assert!(out.contains("nix fmt"), "command missing: {out}");
+        // 1 実行しかない attachment 系に ×1 は出さない (ノイズ)。
+        assert!(!out.contains("×1"), "needless x1: {out}");
+    }
+
+    #[test]
+    fn hook_head_line_inlines_command_and_first_detail() {
+        // hook_success はコマンドが先頭行に載る (折りたたみ不要で「何のフックか」が判る)。
+        let s = parse_jsonl(
+            r#"{"type":"attachment","attachment":{"type":"hook_success","hookName":"PostToolUse:Write","exitCode":0,"durationMs":263,"command":"nix fmt 2>/dev/null || true"}}"#,
+        );
+        let blocks = build_blocks(&s.entries, false);
+        assert_eq!(blocks.len(), 1);
+        assert!(!blocks[0].is_foldable(), "command should be inline");
+        assert!(text_of(&blocks[0].lines[0]).contains("nix fmt"));
+
+        // content 1 件だけの hook_system_message は内容が先頭行に載り、折りたたみ無し。
+        let s = parse_jsonl(
+            r#"{"type":"attachment","attachment":{"type":"hook_system_message","hookName":"PostToolUse:Edit","content":"nix fmt hook fired"}}"#,
+        );
+        let blocks = build_blocks(&s.entries, false);
+        assert_eq!(blocks.len(), 1);
+        assert!(!blocks[0].is_foldable(), "single detail should be inline");
+        assert!(text_of(&blocks[0].lines[0]).contains("nix fmt hook fired"));
+    }
+
+    #[test]
+    fn hook_count_falls_back_to_hookinfos_when_count_missing() {
+        // hookCount 欠落・hookInfos のみでも検出される。件数は hookInfos の数で補う
+        // (「×0 なのに実行時間が出る」不整合を避ける)。
+        let s = parse_jsonl(
+            r#"{"type":"system","subtype":"stop_hook_summary","hookInfos":[{"durationMs":30},{"durationMs":20}]}"#,
+        );
+        let out = joined(&s.entries, false);
+        assert!(out.contains("×2"), "count fallback missing: {out}");
+        assert!(out.contains("50ms"), "total duration missing: {out}");
+    }
+
+    #[test]
+    fn hook_summary_with_errors_shows_error_text() {
+        let s = parse_jsonl(
+            r#"{"type":"system","subtype":"stop_hook_summary","hookCount":1,"hookErrors":["boom"],"preventedContinuation":false}"#,
+        );
+        let out = joined(&s.entries, false);
+        assert!(out.contains("boom"), "error text missing: {out}");
+    }
+
+    #[test]
+    fn hook_summary_prevented_continuation_shows_blocked() {
+        let s = parse_jsonl(
+            r#"{"type":"system","subtype":"stop_hook_summary","hookCount":1,"hookErrors":[],"preventedContinuation":true}"#,
+        );
+        let out = joined(&s.entries, false);
+        assert!(out.contains("blocked"), "blocked marker missing: {out}");
     }
 
     #[test]

@@ -61,6 +61,8 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Action> {
         KeyCode::Esc => Some(Action::Back),
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('b') => Some(Action::ToggleBranches),
+        KeyCode::Char('h') => Some(Action::NextHook),
+        KeyCode::Char('H') => Some(Action::PrevHook),
         _ => None,
     }
 }
