@@ -79,6 +79,8 @@ pub struct HookSummary {
     pub errors: Vec<String>,
     /// フックが継続を阻止したか (`preventedContinuation`)。
     pub prevented_continuation: bool,
+    /// 実行されたコマンド (`command`)。どのフックが発火したかの識別に使う。
+    pub command: Option<String>,
     /// フックが注入した内容の要約 (`content`)。折りたたみ行として表示する。
     pub details: Vec<String>,
 }
@@ -199,6 +201,10 @@ fn parse_hook_attachment(attachment: &Value, attachment_type: &str) -> HookSumma
         durations_ms,
         errors,
         prevented_continuation: false,
+        command: attachment
+            .get("command")
+            .and_then(Value::as_str)
+            .map(one_line),
         details,
     }
 }
@@ -243,6 +249,7 @@ fn parse_hook_summary(value: &Value) -> HookSummary {
             .get("preventedContinuation")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        command: None,
         details: Vec::new(),
     }
 }
@@ -509,6 +516,7 @@ mod tests {
                 "exitCode": 0,
                 "durationMs": 263,
                 "content": "",
+                "command": "nix fmt 2>/dev/null || true",
             },
         });
         let EntryKind::Hook(h) = parse_entry(&v).kind else {
@@ -517,6 +525,7 @@ mod tests {
         assert_eq!(h.name, "PostToolUse:Write");
         assert_eq!(h.hook_count, 1);
         assert_eq!(h.durations_ms, vec![263]);
+        assert_eq!(h.command.as_deref(), Some("nix fmt 2>/dev/null || true"));
         assert!(h.errors.is_empty());
         assert!(h.details.is_empty());
     }

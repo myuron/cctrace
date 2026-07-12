@@ -368,10 +368,34 @@ fn hook_lines(summary: &HookSummary) -> Vec<Line<'static>> {
     } else {
         summary.hook_count
     };
+    // 1 実行の ×1 はノイズなので、複数実行時のみ件数を出す。
+    let head_label = if count > 1 {
+        format!("⚡ {name} ×{count}")
+    } else {
+        format!("⚡ {name}")
+    };
     let mut spans = vec![Span::styled(
-        format!("⚡ {name} ×{count}"),
+        head_label,
         Style::default().fg(HOOK_COLOR).add_modifier(Modifier::BOLD),
     )];
+
+    // 「どのフックが発火したか」を先頭行で判別できるよう、コマンド (優先) または
+    // 最初の注入内容をインラインで載せる。残りの注入内容は折りたたみ行に回す。
+    let mut details: &[String] = &summary.details;
+    let inline = if summary.command.is_some() {
+        summary.command.clone()
+    } else if let Some((first, rest)) = details.split_first() {
+        details = rest;
+        Some(first.clone())
+    } else {
+        None
+    };
+    if let Some(info) = inline {
+        spans.push(Span::styled(
+            format!("  {}", truncate_chars(&info, 60)),
+            dim_style(),
+        ));
+    }
 
     let total_ms: u64 = summary.durations_ms.iter().sum();
     if !summary.durations_ms.is_empty() {
@@ -401,11 +425,21 @@ fn hook_lines(summary: &HookSummary) -> Vec<Line<'static>> {
             Style::default().fg(Color::Red),
         )));
     }
-    // フックが注入した内容 (折りたたみ行)。
-    for detail in &summary.details {
+    // フックが注入した内容の残り (折りたたみ行)。
+    for detail in details {
         lines.push(dim_line(format!("  ↳ {detail}")));
     }
     lines
+}
+
+/// インライン表示用に文字数上限で切り詰める (長いコマンドが行を占有しないように)。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…")
+    } else {
+        s.to_owned()
+    }
 }
 
 /// tool_use の 1 行。`Skill` 起動は SPEC §7 に従い強調する。
@@ -582,14 +616,39 @@ mod tests {
     #[test]
     fn hook_attachment_rendered_with_name_duration_and_details() {
         let s = parse_jsonl(
-            "{\"type\":\"attachment\",\"attachment\":{\"type\":\"hook_success\",\"hookName\":\"PostToolUse:Write\",\"exitCode\":0,\"durationMs\":263}}\n\
+            "{\"type\":\"attachment\",\"attachment\":{\"type\":\"hook_success\",\"hookName\":\"PostToolUse:Write\",\"exitCode\":0,\"durationMs\":263,\"command\":\"nix fmt 2>/dev/null || true\"}}\n\
              {\"type\":\"attachment\",\"attachment\":{\"type\":\"hook_additional_context\",\"hookName\":\"PostToolUse:Edit\",\"content\":[\"fmt ran on /a/b.rs\"]}}",
         );
         let out = joined(&s.entries, false);
-        assert!(out.contains("⚡ PostToolUse:Write ×1"), "got: {out}");
+        assert!(out.contains("⚡ PostToolUse:Write"), "got: {out}");
         assert!(out.contains("263ms"), "got: {out}");
-        assert!(out.contains("⚡ PostToolUse:Edit ×1"), "got: {out}");
+        assert!(out.contains("⚡ PostToolUse:Edit"), "got: {out}");
         assert!(out.contains("fmt ran on /a/b.rs"), "got: {out}");
+        // どのフックかを示すコマンドが表示される。
+        assert!(out.contains("nix fmt"), "command missing: {out}");
+        // 1 実行しかない attachment 系に ×1 は出さない (ノイズ)。
+        assert!(!out.contains("×1"), "needless x1: {out}");
+    }
+
+    #[test]
+    fn hook_head_line_inlines_command_and_first_detail() {
+        // hook_success はコマンドが先頭行に載る (折りたたみ不要で「何のフックか」が判る)。
+        let s = parse_jsonl(
+            r#"{"type":"attachment","attachment":{"type":"hook_success","hookName":"PostToolUse:Write","exitCode":0,"durationMs":263,"command":"nix fmt 2>/dev/null || true"}}"#,
+        );
+        let blocks = build_blocks(&s.entries, false);
+        assert_eq!(blocks.len(), 1);
+        assert!(!blocks[0].is_foldable(), "command should be inline");
+        assert!(text_of(&blocks[0].lines[0]).contains("nix fmt"));
+
+        // content 1 件だけの hook_system_message は内容が先頭行に載り、折りたたみ無し。
+        let s = parse_jsonl(
+            r#"{"type":"attachment","attachment":{"type":"hook_system_message","hookName":"PostToolUse:Edit","content":"nix fmt hook fired"}}"#,
+        );
+        let blocks = build_blocks(&s.entries, false);
+        assert_eq!(blocks.len(), 1);
+        assert!(!blocks[0].is_foldable(), "single detail should be inline");
+        assert!(text_of(&blocks[0].lines[0]).contains("nix fmt hook fired"));
     }
 
     #[test]

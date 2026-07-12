@@ -157,18 +157,18 @@ Hook や Skill が意図したタイミングで起動しているかを確認�
 
 ## 7. エントリ描画ルール（MVP）
 
-| type / 内容                       | 表示                                                                       |
-| --------------------------------- | -------------------------------------------------------------------------- |
-| `user` (text)                     | ユーザー発話として表示                                                     |
-| `assistant` text                  | アシスタント応答                                                           |
-| `assistant` thinking              | 思考。折りたたみ or 淡色で区別（案）                                       |
-| `assistant` tool_use              | ツール名 + 主要 input を1行要約。`Skill` は強調                            |
-| `attributionSkill` 付き           | 「Skill 由来」バッジを付与                                                 |
-| `attachment` (hook\_\* )          | フック実行として ⚡ で強調。hookName・実行時間・エラー・注入内容を表示     |
-| `attachment` (skill_listing 等)   | 種別を短く表示（詳細は折りたたみ、案）                                     |
-| `system` (hook summary)           | フック実行として ⚡ で強調。種別・実行数・実行時間・エラー・継続阻止を表示 |
-| `system` (その他)                 | 補助情報として淡色表示（`turn_duration` 等は集約 or 非表示、案）           |
-| メタ系 (ai-title/mode/pr-link 等) | MVP 非表示（将来拡張）                                                     |
+| type / 内容                       | 表示                                                                             |
+| --------------------------------- | -------------------------------------------------------------------------------- |
+| `user` (text)                     | ユーザー発話として表示                                                           |
+| `assistant` text                  | アシスタント応答                                                                 |
+| `assistant` thinking              | 思考。折りたたみ or 淡色で区別（案）                                             |
+| `assistant` tool_use              | ツール名 + 主要 input を1行要約。`Skill` は強調                                  |
+| `attributionSkill` 付き           | 「Skill 由来」バッジを付与                                                       |
+| `attachment` (hook\_\* )          | フック実行として ⚡ で強調。hookName・コマンド・実行時間・エラー・注入内容を表示 |
+| `attachment` (skill_listing 等)   | 種別を短く表示（詳細は折りたたみ、案）                                           |
+| `system` (hook summary)           | フック実行として ⚡ で強調。種別・実行数・実行時間・エラー・継続阻止を表示       |
+| `system` (その他)                 | 補助情報として淡色表示（`turn_duration` 等は集約 or 非表示、案）                 |
+| メタ系 (ai-title/mode/pr-link 等) | MVP 非表示（将来拡張）                                                           |
 
 木構造 (`parentUuid`) の扱い:
 
