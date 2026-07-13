@@ -5,6 +5,7 @@ mod app;
 mod model;
 mod project;
 mod session;
+mod theme;
 mod ui;
 
 use std::io;

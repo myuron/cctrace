@@ -8,21 +8,18 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Cell, List, ListItem, ListState, Paragraph, Row, Table};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Screen};
 use crate::model::{Block as ContentBlock, Entry, EntryKind, HookSummary};
-
-const SKILL_COLOR: Color = Color::Magenta;
-/// フック起動を目立たせる色。Skill(Magenta)/tool(Yellow) 等と混ざらない色を選ぶ。
-const HOOK_COLOR: Color = Color::LightBlue;
+use crate::theme;
 
 /// タイムライン表の Time 列幅 (`draw_timeline` の Constraint と一致させる)。
 const TIME_COL_WIDTH: u16 = 8;
 /// タイムライン表の Kind 列幅 (同上)。
 const KIND_COL_WIDTH: u16 = 10;
-/// Detail 列以外がテーブル内で消費する幅。選択記号 (▶ ＝2)、列間スペース×2、
+/// Detail 列以外がテーブル内で消費する幅。選択記号 (▌ ＝2)、列間スペース×2、
 /// Time/Kind 列の合計。Detail 列の折り返し幅を求めるために描画側と共有する。
 const NON_DETAIL_WIDTH: u16 = 2 + 2 + TIME_COL_WIDTH + KIND_COL_WIDTH;
 
@@ -35,51 +32,57 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_session_list(frame: &mut Frame, app: &App) {
-    let areas = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(frame.area());
+    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
 
-    frame.render_widget(
-        Line::from(Span::styled(
-            " cctrace — sessions ",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        areas[0],
-    );
+    // 角丸ブロックのタイトルにアプリ名と件数を載せ、独立したヘッダ行を省いて
+    // 内容領域を広く使う (lazygit 等のモダン TUI に倣う)。
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::BORDER))
+        .title(Line::from(vec![
+            Span::styled(" cctrace ", theme::accent_bold()),
+            Span::styled("· sessions ", theme::muted()),
+        ]))
+        .title(
+            Line::from(Span::styled(
+                format!(" {} found ", app.sessions.len()),
+                theme::muted(),
+            ))
+            .right_aligned(),
+        );
 
     if app.sessions.is_empty() {
-        let empty =
-            Paragraph::new("このプロジェクトのセッションが見つかりません (~/.claude/projects)。")
-                .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(empty, areas[1]);
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "このプロジェクトのセッションが見つかりません (~/.claude/projects)。",
+            theme::muted(),
+        )))
+        .block(block);
+        frame.render_widget(empty, areas[0]);
     } else {
         let items: Vec<ListItem> = app
             .sessions
             .iter()
             .map(|s| {
                 let title = s.title.as_deref().unwrap_or("(no title)");
-                ListItem::new(format!("{}  {}", format_mtime(s.modified), title))
+                ListItem::new(Line::from(vec![
+                    Span::styled(format_mtime(s.modified), theme::muted()),
+                    Span::raw("  "),
+                    Span::raw(title.to_owned()),
+                ]))
             })
             .collect();
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL))
-            .highlight_style(
-                Style::default()
-                    .bg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("▶ ");
+            .block(block)
+            .highlight_style(theme::selection())
+            .highlight_symbol(Span::styled("▌ ", theme::accent_bold()));
         let mut state = ListState::default();
         state.select(Some(app.list_selected));
-        frame.render_stateful_widget(list, areas[1], &mut state);
+        frame.render_stateful_widget(list, areas[0], &mut state);
     }
 
     frame.render_widget(
-        hint_line("↑/↓ or j/k: 移動   Enter: 開く   q: 終了"),
-        areas[2],
+        key_hints(&[("↑↓/jk", "移動"), ("⏎", "開く"), ("q", "終了")]),
+        areas[1],
     );
 }
 
@@ -96,22 +99,37 @@ fn draw_timeline(frame: &mut Frame, app: &mut App) {
     };
 
     // フック起動数はツールの核 (フックが起動したかの確認)。ヘッダに常時出す。
+    // ラベルは muted、値は強調の 2 トーンで情報の階層をつける。
     let hook_count = open.blocks.iter().filter(|b| b.is_hook()).count();
-    let header = format!(
-        " {}   entries: {}{}   hooks: {}   branches: {}",
-        open.meta.id,
-        open.data.entries.len(),
-        skipped_suffix(open.data.skipped_lines),
-        hook_count,
-        if app.show_branches { "on" } else { "off" },
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            header,
+    let mut header = vec![
+        Span::styled(format!(" {} ", open.meta.id), theme::accent_bold()),
+        Span::styled(" entries ", theme::muted()),
+        Span::styled(
+            format!(
+                "{}{}",
+                open.data.entries.len(),
+                skipped_suffix(open.data.skipped_lines)
+            ),
             Style::default().add_modifier(Modifier::BOLD),
-        ))),
-        areas[0],
-    );
+        ),
+        Span::styled("  hooks ", theme::muted()),
+        Span::styled(
+            hook_count.to_string(),
+            Style::default()
+                .fg(theme::HOOK)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  branches ", theme::muted()),
+    ];
+    header.push(if app.show_branches {
+        Span::styled(
+            "on",
+            Style::default().fg(theme::OK).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("off", theme::muted())
+    });
+    frame.render_widget(Paragraph::new(Line::from(header)), areas[0]);
 
     // ブロックはキャッシュ済み (OpenSession)。展開状態に応じて可視行へ平坦化する。
     // 再描画はキー入力駆動 (main のイベントループ) なので、入力ごとに 1 度だけ
@@ -137,18 +155,25 @@ fn draw_timeline(frame: &mut Frame, app: &mut App) {
     ];
     let header = Row::new(["Time", "Kind", "Detail"]).style(
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(theme::MUTED)
             .add_modifier(Modifier::BOLD),
     );
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL))
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::BORDER))
+                .title(Line::from(vec![
+                    Span::styled(" timeline ", theme::accent_bold()),
+                    Span::styled(
+                        format!("· ⚡ {hook_count} hooks "),
+                        Style::default().fg(theme::HOOK),
+                    ),
+                ])),
         )
-        .highlight_symbol("▶ ");
+        .row_highlight_style(theme::selection())
+        .highlight_symbol(Span::styled("▌ ", theme::accent_bold()));
 
     // 選択ブロックの先頭行を選択状態にし、可視領域維持のスクロールは TableState に委ねる。
     let selection = (!open.blocks.is_empty()).then_some(selected_row);
@@ -156,9 +181,15 @@ fn draw_timeline(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(table, areas[1], &mut open.table_state);
 
     frame.render_widget(
-        hint_line(
-            "↑/↓ or j/k: 選択   Enter: 開閉   g/G: 先頭/末尾   h/H: フック   b: 分岐表示   Esc: 一覧   q: 終了",
-        ),
+        key_hints(&[
+            ("↑↓/jk", "選択"),
+            ("⏎", "開閉"),
+            ("g/G", "先頭/末尾"),
+            ("h/H", "フック"),
+            ("b", "分岐表示"),
+            ("esc", "一覧"),
+            ("q", "終了"),
+        ]),
         areas[2],
     );
 }
@@ -213,10 +244,10 @@ fn entry_blocks(entry: &Entry, blocks: &mut Vec<TimelineBlock>) {
     let time = time_col(entry);
     match &entry.kind {
         EntryKind::User(content) => {
-            push_message_blocks(blocks, time, "You", Color::Green, content, entry)
+            push_message_blocks(blocks, time, "You", theme::USER, content, entry)
         }
         EntryKind::Assistant(content) => {
-            push_message_blocks(blocks, time, "Claude", Color::Cyan, content, entry)
+            push_message_blocks(blocks, time, "Claude", theme::ASSISTANT, content, entry)
         }
         EntryKind::System { subtype, .. } => {
             let label = subtype.clone().unwrap_or_default();
@@ -232,7 +263,9 @@ fn entry_blocks(entry: &Entry, blocks: &mut Vec<TimelineBlock>) {
                 time,
                 kind: Line::from(Span::styled(
                     "hook",
-                    Style::default().fg(HOOK_COLOR).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::HOOK)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 lines: hook_lines(summary),
                 is_hook: true,
@@ -345,7 +378,8 @@ fn block_rows(block: &TimelineBlock, expanded: bool, detail_width: usize) -> Vec
     }
 
     let mut rows = vec![Row::new(vec![
-        Cell::from(block.time.clone()),
+        // Time はセカンダリ情報なので muted で一段下げる。
+        Cell::from(Span::styled(block.time.clone(), theme::muted())),
         Cell::from(block.kind.clone()),
         Cell::from(head),
     ])];
@@ -412,7 +446,7 @@ fn block_detail_lines(block: &ContentBlock) -> Vec<Line<'static>> {
         ContentBlock::Thinking(text) => {
             let mut lines = vec![dim_line("· thinking")];
             lines.extend(
-                text_body_lines(text, Color::DarkGray)
+                text_body_lines(text, theme::MUTED)
                     .into_iter()
                     .map(|l| l.style(Style::default().add_modifier(Modifier::DIM))),
             );
@@ -450,7 +484,9 @@ fn hook_lines(summary: &HookSummary) -> Vec<Line<'static>> {
     };
     let mut spans = vec![Span::styled(
         head_label,
-        Style::default().fg(HOOK_COLOR).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme::HOOK)
+            .add_modifier(Modifier::BOLD),
     )];
 
     // 「どのフックが発火したか」を先頭行で判別できるよう、コマンド (優先) または
@@ -480,15 +516,19 @@ fn hook_lines(summary: &HookSummary) -> Vec<Line<'static>> {
     let status = if !summary.errors.is_empty() {
         Span::styled(
             format!("  ✗ {} error(s)", summary.errors.len()),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
         )
     } else if summary.prevented_continuation {
         Span::styled(
             "  ⛔ blocked",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
         )
     } else {
-        Span::styled("  ✓ ok", Style::default().fg(Color::Green))
+        Span::styled("  ✓ ok", Style::default().fg(theme::OK))
     };
     spans.push(status);
 
@@ -496,7 +536,7 @@ fn hook_lines(summary: &HookSummary) -> Vec<Line<'static>> {
     for err in &summary.errors {
         lines.push(Line::from(Span::styled(
             format!("  ↳ {err}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme::ERROR),
         )));
     }
     // フックが注入した内容の残り (折りたたみ行)。
@@ -517,21 +557,24 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// tool_use の 1 行。`Skill` 起動は SPEC §7 に従い強調する。
+/// ツール名と引数サマリは 2 トーンにして走査しやすくする。
 fn tool_use_line(name: &str, summary: &str, skill: Option<&str>) -> Line<'static> {
     if let Some(skill) = skill {
         return Line::from(vec![Span::styled(
             format!("✦ Skill: {skill}"),
             Style::default()
-                .fg(SKILL_COLOR)
+                .fg(theme::SKILL)
                 .add_modifier(Modifier::BOLD),
         )]);
     }
-    let text = if summary.is_empty() {
-        format!("⚙ {name}")
-    } else {
-        format!("⚙ {name}  {summary}")
-    };
-    Line::from(Span::styled(text, Style::default().fg(Color::Yellow)))
+    let mut spans = vec![Span::styled(
+        format!("⚙ {name}"),
+        Style::default().fg(theme::TOOL),
+    )];
+    if !summary.is_empty() {
+        spans.push(Span::styled(format!("  {summary}"), theme::muted()));
+    }
+    Line::from(spans)
 }
 
 /// 本文テキストを行に分割する (折り返しはせず改行で分割、長い行は描画時にクリップ)。
@@ -557,27 +600,37 @@ fn attribution_badge(entry: &Entry) -> Option<Span<'static>> {
         Span::styled(
             format!("[skill:{skill}]"),
             Style::default()
-                .fg(SKILL_COLOR)
+                .fg(theme::SKILL)
                 .add_modifier(Modifier::BOLD),
         )
     })
 }
 
 fn dim_style() -> Style {
-    Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM)
+    theme::muted()
 }
 
 fn dim_line(text: impl Into<String>) -> Line<'static> {
     Line::from(Span::styled(text.into(), dim_style()))
 }
 
-fn hint_line(text: &str) -> Paragraph<'static> {
-    Paragraph::new(Line::from(Span::styled(
-        format!(" {text}"),
-        Style::default().fg(Color::DarkGray),
-    )))
+/// フッターのキーヒント行。キーをアクセント色、説明を muted の 2 トーンで示す
+/// (lazygit / k9s 等のモダン TUI に共通のパターン)。
+fn key_hints(pairs: &[(&str, &str)]) -> Paragraph<'static> {
+    let mut spans = Vec::new();
+    for (i, (key, label)) in pairs.iter().enumerate() {
+        spans.push(Span::styled(
+            format!("{}{key}", if i == 0 { " " } else { "" }),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {label}"), theme::muted()));
+        if i + 1 < pairs.len() {
+            spans.push(Span::styled("  ·  ", theme::muted()));
+        }
+    }
+    Paragraph::new(Line::from(spans))
 }
 
 fn skipped_suffix(skipped: usize) -> String {
